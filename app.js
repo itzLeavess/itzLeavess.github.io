@@ -39,8 +39,14 @@
 
 /* ─── Image Fade-in ─── */
 function markLoadedImage(img) {
-  if (img instanceof HTMLImageElement && img.complete) {
+  if (!(img instanceof HTMLImageElement)) return;
+  if (img.complete && img.naturalWidth > 0) {
     img.classList.add('loaded');
+  } else if (img.complete && img.naturalWidth === 0 && !img.dataset.retried) {
+    img.dataset.retried = '1';
+    const src = img.src;
+    img.src = '';
+    requestAnimationFrame(() => { img.src = src; });
   }
 }
 
@@ -406,6 +412,7 @@ document.querySelectorAll('.work-card').forEach(card => {
     modalTitle.textContent = title;
     modalDesc.innerHTML = renderMarkdown(desc);
     modalDesc.querySelectorAll('img').forEach(img => {
+      if (/^\/pic\//.test(img.getAttribute('src') || '')) img.src = '.' + img.getAttribute('src');
       img.loading = 'lazy';
       img.decoding = 'async';
       img.fetchPriority = 'low';
@@ -414,22 +421,22 @@ document.querySelectorAll('.work-card').forEach(card => {
     const multiImagesStr = card.dataset.images;
 
     if (multiImagesStr) {
-      const urls = multiImagesStr.split(',').filter(Boolean);
+      const urls = multiImagesStr.split(',').filter(Boolean).map(u => u.trim().replace(/^\/+/, './'));
       let sliderHTML = '<div class="work-carousel-wrap" id="carouselWrap"><div class="work-carousel-track" id="carouselTrack">';
-      
-      // Infinite tracking: clone last slide
-      sliderHTML += `<div class="work-carousel-item clone"><img src="${encodeURI(urls[urls.length - 1].trim())}" alt="${title}" loading="lazy" decoding="async" fetchpriority="low"></div>`;
       
       urls.forEach((url, index) => {
         const priority = index === 0 ? 'high' : 'low';
-        const loading = index === 0 ? 'eager' : 'lazy';
+        const loading = 'eager';
         sliderHTML += `<div class="work-carousel-item"><img src="${encodeURI(url.trim())}" alt="${title}" loading="${loading}" decoding="async" fetchpriority="${priority}"></div>`;
       });
       
-      // Infinite tracking: clone first slide
-      sliderHTML += `<div class="work-carousel-item clone"><img src="${encodeURI(urls[0].trim())}" alt="${title}" loading="lazy" decoding="async" fetchpriority="low"></div>`;
-
-      sliderHTML += '</div><div class="work-carousel-dots">';
+      sliderHTML += '</div>';
+      if (urls.length > 1) {
+        sliderHTML += `<button class="work-carousel-nav prev" type="button" aria-label="上一张"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M10 3L5 8l5 5"/></svg></button>`;
+        sliderHTML += `<button class="work-carousel-nav next" type="button" aria-label="下一张"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M6 3l5 5-5 5"/></svg></button>`;
+        sliderHTML += `<span class="work-carousel-count" aria-live="polite">1/${urls.length}</span>`;
+      }
+      sliderHTML += '<div class="work-carousel-dots">';
       urls.forEach((_, i) => {
         sliderHTML += `<div class="work-carousel-dot ${i === 0 ? 'active' : ''}" data-index="${i}"></div>`;
       });
@@ -440,7 +447,7 @@ document.querySelectorAll('.work-card').forEach(card => {
       
       initCarousel(urls.length);
     } else if (img && img !== 'undefined' && img !== '') {
-      modalImg.innerHTML = `<img src="${img}" alt="${title}" loading="eager" decoding="async" fetchpriority="high">`;
+      modalImg.innerHTML = `<img src="${String(img).replace(/^\/+/, './')}" alt="${title}" loading="eager" decoding="async" fetchpriority="high">`;
       modalImg.style.background = '';
       modalImg.querySelectorAll('img').forEach(markLoadedImage);
     } else {
@@ -461,14 +468,19 @@ document.querySelectorAll('.work-card').forEach(card => {
 });
 
 let carouselCleanup = null;
+let carouselDrag = { moved: false, x: 0 };
+let suppressModalImageClick = false;
 
 function initCarousel(total) {
   const wrap = document.querySelector('.work-carousel-wrap');
   const track = document.getElementById('carouselTrack');
   const dots = document.querySelectorAll('.work-carousel-dot');
+  const count = wrap.querySelector('.work-carousel-count');
+  const prevBtn = wrap.querySelector('.work-carousel-nav.prev');
+  const nextBtn = wrap.querySelector('.work-carousel-nav.next');
   if (!track || !wrap) return;
 
-  let currentSlide = 1;
+  let currentSlide = 0;
   let isDragging = false;
   let startX = 0;
   let currentTranslate = 0;
@@ -483,45 +495,57 @@ function initCarousel(total) {
   const getTrackWidth = () => wrap.clientWidth || window.innerWidth;
 
   const updateDots = () => {
-    let dotIndex = currentSlide - 1;
-    if (dotIndex < 0) dotIndex = total - 1;
-    if (dotIndex >= total) dotIndex = 0;
+    const dotIndex = currentSlide;
     dots.forEach((dot, i) => dot.classList.toggle('active', i === dotIndex));
+    if (count) count.textContent = `${dotIndex + 1}/${total}`;
+    carouselCurrentIndex = dotIndex;
+    if (prevBtn) {
+      prevBtn.classList.toggle('disabled', dotIndex <= 0);
+      prevBtn.disabled = dotIndex <= 0;
+    }
+    if (nextBtn) {
+      nextBtn.classList.toggle('disabled', dotIndex >= total - 1);
+      nextBtn.disabled = dotIndex >= total - 1;
+    }
   };
   
+  let snapTimer = 0;
+  const minTranslate = () => -(total - 1) * getTrackWidth();
+  const clampSlide = () => { currentSlide = Math.min(total - 1, Math.max(0, currentSlide)); };
+  // Rubber-band: overshoot beyond the edges decays with 0.35x resistance.
+  const rubberTranslate = (raw) => {
+    const min = minTranslate(), max = 0;
+    if (raw > max) return max + (raw - max) * 0.35;
+    if (raw < min) return min + (raw - min) * 0.35;
+    return raw;
+  };
+  const settleSlide = () => {
+    clearTimeout(snapTimer);
+    isTransitioning = false;
+  };
+
   const setPositionByIndex = () => {
     isTransitioning = true;
+    clampSlide();
     currentTranslate = currentSlide * -getTrackWidth();
     prevTranslate = currentTranslate;
     track.style.transition = 'transform 0.3s ease-out';
     track.style.transform = `translateX(${currentTranslate}px)`;
     updateDots();
+    // Safety net: if 'transitionend' never fires (unchanged transform, hidden tab,
+    // interrupted animation), settle the slide ourselves after the animation window.
+    clearTimeout(snapTimer);
+    snapTimer = setTimeout(settleSlide, 380);
   };
 
-  const handleTransitionEnd = () => {
-    isTransitioning = false;
-    if (currentSlide === 0) {
-      track.style.transition = 'none';
-      currentSlide = total;
-      currentTranslate = currentSlide * -getTrackWidth();
-      prevTranslate = currentTranslate;
-      track.style.transform = `translateX(${currentTranslate}px)`;
-    } else if (currentSlide === total + 1) {
-      track.style.transition = 'none';
-      currentSlide = 1;
-      currentTranslate = currentSlide * -getTrackWidth();
-      prevTranslate = currentTranslate;
-      track.style.transform = `translateX(${currentTranslate}px)`;
-    }
-  };
+  track.addEventListener('transitionend', settleSlide);
 
-  track.addEventListener('transitionend', handleTransitionEnd);
-
-  // Jump to the first actual slide without animation
+  // Jump to the first slide without animation
   track.style.transition = 'none';
-  currentTranslate = currentSlide * -getTrackWidth();
-  prevTranslate = currentTranslate;
-  track.style.transform = `translateX(${currentTranslate}px)`;
+  currentTranslate = 0;
+  prevTranslate = 0;
+  track.style.transform = 'translateX(0px)';
+  updateDots();
 
   const resizeHandler = () => {
     track.style.transition = 'none';
@@ -535,18 +559,24 @@ function initCarousel(total) {
   dots.forEach((dot, i) => {
     const handler = () => {
       if (isTransitioning) return;
-      currentSlide = i + 1;
+      currentSlide = i;
       setPositionByIndex();
     };
     dot.addEventListener('click', handler);
     dotClickHandlers.push({dot, handler});
   });
 
+  const navPrev = () => { if (!isTransitioning && currentSlide > 0) { currentSlide -= 1; setPositionByIndex(); } };
+  const navNext = () => { if (!isTransitioning && currentSlide < total - 1) { currentSlide += 1; setPositionByIndex(); } };
+  prevBtn?.addEventListener('click', navPrev);
+  nextBtn?.addEventListener('click', navNext);
   const getPositionX = (e) => (e.type.includes('mouse') ? e.pageX : e.touches[0].clientX);
 
   const touchStart = (e) => {
     if (isTransitioning) return;
+    if (e.target.closest && e.target.closest('.work-carousel-nav, .work-carousel-dot')) return;
     isDragging = true;
+    carouselDrag = { moved: false, x: getPositionX(e) };
     startX = getPositionX(e);
     track.style.transition = 'none';
   };
@@ -554,24 +584,73 @@ function initCarousel(total) {
   const touchMove = (e) => {
     if (!isDragging) return;
     const currentPosition = getPositionX(e);
-    currentTranslate = prevTranslate + currentPosition - startX;
+    if (carouselDrag && Math.abs(currentPosition - carouselDrag.x) > 8) {
+      carouselDrag.moved = true;
+      wrap.classList.add('is-dragging');
+    }
+    currentTranslate = rubberTranslate(prevTranslate + currentPosition - startX);
     track.style.transform = `translateX(${currentTranslate}px)`;
   };
 
   const touchEnd = () => {
     if (!isDragging) return;
     isDragging = false;
+    wrap.classList.remove('is-dragging');
     const movedBy = currentTranslate - prevTranslate;
     const threshold = getTrackWidth() * 0.15;
 
-    if (movedBy < -threshold) {
+    if (movedBy < -threshold && currentSlide < total - 1) {
       currentSlide += 1;
-    } else if (movedBy > threshold) {
+    } else if (movedBy > threshold && currentSlide > 0) {
       currentSlide -= 1;
     }
-    
+
     setPositionByIndex();
   };
+
+  // Gesture arbiter: runs independently of the carousel animation state.
+  // A horizontal move always wins over opening the image, even if the carousel
+  // happens to be finishing its previous snap animation.
+  let gestureStartX = null;
+  let gestureMoved = false;
+  const gestureX = e => e.touches?.[0]?.clientX ?? e.changedTouches?.[0]?.clientX ?? e.clientX;
+  const gestureStart = e => { gestureStartX = gestureX(e); gestureMoved = false; };
+  const gestureMove = e => {
+    if (gestureStartX === null) return;
+    if (Math.abs(gestureX(e) - gestureStartX) > 8) gestureMoved = true;
+  };
+  const gestureEnd = () => {
+    if (gestureMoved) {
+      suppressModalImageClick = true;
+      // Keep the guard through browsers' synthetic click after touchend/mouseup.
+      window.setTimeout(() => { suppressModalImageClick = false; }, 500);
+    }
+    gestureStartX = null;
+  };
+  const suppressClick = e => {
+    if (!suppressModalImageClick) return;
+    suppressModalImageClick = false;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  };
+
+  wrap.addEventListener('mousedown', gestureStart, true);
+  wrap.addEventListener('touchstart', gestureStart, { passive: true, capture: true });
+  window.addEventListener('mousemove', gestureMove, true);
+  window.addEventListener('touchmove', gestureMove, { passive: true, capture: true });
+  window.addEventListener('mouseup', gestureEnd, true);
+  window.addEventListener('touchend', gestureEnd, true);
+  wrap.addEventListener('click', suppressClick, true);
+  // Disabled-state arrows must be fully inert: capture-phase block BEFORE any
+  // bubble handler (including the media-area lightbox opener) can see them.
+  wrap.addEventListener('click', e => {
+    const nav = e.target.closest('.work-carousel-nav');
+    if (nav && nav.classList.contains('disabled')) {
+      e.stopImmediatePropagation();
+      e.preventDefault();
+      toastEdge(nav === prevBtn ? '已经是第一张图片～' : '已经是最后一张图片～');
+    }
+  }, true);
 
   wrap.addEventListener('mousedown', touchStart);
   wrap.addEventListener('touchstart', touchStart, {passive: true});
@@ -584,8 +663,18 @@ function initCarousel(total) {
     window.removeEventListener('resize', resizeHandler);
     window.removeEventListener('mouseup', touchEnd);
     window.removeEventListener('mousemove', touchMove);
-    track.removeEventListener('transitionend', handleTransitionEnd);
+    wrap.removeEventListener('mousedown', gestureStart, true);
+    wrap.removeEventListener('touchstart', gestureStart, true);
+    window.removeEventListener('mousemove', gestureMove, true);
+    window.removeEventListener('touchmove', gestureMove, true);
+    window.removeEventListener('mouseup', gestureEnd, true);
+    window.removeEventListener('touchend', gestureEnd, true);
+    wrap.removeEventListener('click', suppressClick, true);
+    track.removeEventListener('transitionend', settleSlide);
+    clearTimeout(snapTimer);
     dotClickHandlers.forEach(({dot, handler}) => dot.removeEventListener('click', handler));
+    prevBtn?.removeEventListener('click', navPrev);
+    nextBtn?.removeEventListener('click', navNext);
   };
 }
 
@@ -600,4 +689,167 @@ function closeModal() {
 
 modalClose.addEventListener('click', closeModal);
 modalOverlay.addEventListener('click', closeModal);
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && !lbState.open) closeModal();
+});
+
+
+/* ─── Image Lightbox ─── */
+const lightbox = document.getElementById('imgLightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+const lightboxStage = document.getElementById('lightboxStage');
+const lbClose = document.getElementById('lightboxClose');
+const lbPrev = document.getElementById('lbPrev');
+const lbNext = document.getElementById('lbNext');
+const lbCounter = document.getElementById('lbCounter');
+const lbZoomIn = document.getElementById('lbZoomIn');
+const lbZoomOut = document.getElementById('lbZoomOut');
+const lbZoomLabel = document.getElementById('lbZoomLabel');
+const lbFit = document.getElementById('lbFit');
+const lbActual = document.getElementById('lbActual');
+
+const lbState = { urls: [], index: 0, scale: 1, open: false };
+const SCALE_STEP = 1.25;
+const SCALE_MIN = 0.2;
+const SCALE_MAX = 6;
+
+function lbApplyTransform() {
+  lightboxImg.style.transform = `scale(${lbState.scale})`;
+  lbZoomLabel.textContent = Math.round(lbState.scale * 100) + '%';
+}
+
+function lbShow(i) {
+  if (!lbState.urls.length) return;
+  lbState.index = (i + lbState.urls.length) % lbState.urls.length;
+  lbState.scale = 1;
+  lightboxImg.classList.remove('loaded');
+  // Fade in once the image is decoded (cached images decode instantly too).
+  const url = lbState.urls[lbState.index];
+  const decode = () => {
+    if (lbState.urls[lbState.index] !== url) return;
+    lightboxImg.classList.add('loaded');
+  };
+  if (lightboxImg.decode) {
+    lightboxImg.src = url;
+    lightboxImg.decode().then(decode).catch(() => { lightboxImg.onload = decode; });
+  } else {
+    lightboxImg.onload = decode;
+    lightboxImg.src = url;
+  }
+  lbApplyTransform();
+  lbCounter.textContent = `${lbState.index + 1}/${lbState.urls.length}`;
+  const single = lbState.urls.length <= 1;
+  lbPrev.classList.toggle('disabled', single);
+  lbNext.classList.toggle('disabled', single);
+}
+
+function lbOpen(urls, index = 0) {
+  lbState.urls = urls;
+  lbState.open = true;
+  lightbox.classList.add('active');
+  document.body.style.overflow = 'hidden';
+  lbShow(index);
+}
+
+function lbCloseFn() {
+  lbState.open = false;
+  lightbox.classList.remove('active');
+  lightboxImg.src = '';
+  // Restore scroll only if the work modal is no longer open on top.
+  const modalStillOpen = document.getElementById('workModal')?.classList.contains('active');
+  document.body.style.overflow = modalStillOpen ? 'hidden' : '';
+}
+
+lbClose.addEventListener('click', lbCloseFn);
+lightbox.addEventListener('click', e => { if (e.target === lightbox || e.target.classList.contains('lightbox-stage')) lbCloseFn(); });
+document.addEventListener('keydown', e => {
+  if (!lbState.open) return;
+  if (e.key === 'Escape') lbCloseFn();
+  else if (e.key === 'ArrowLeft') lbShow(lbState.index - 1);
+  else if (e.key === 'ArrowRight') lbShow(lbState.index + 1);
+});
+lbPrev.addEventListener('click', () => lbShow(lbState.index - 1));
+lbNext.addEventListener('click', () => lbShow(lbState.index + 1));
+lbZoomIn.addEventListener('click', () => { lbState.scale = Math.min(SCALE_MAX, lbState.scale * SCALE_STEP); lbApplyTransform(); });
+lbZoomOut.addEventListener('click', () => { lbState.scale = Math.max(SCALE_MIN, lbState.scale / SCALE_STEP); lbApplyTransform(); });
+lbFit.addEventListener('click', () => { lbState.scale = 1; lbApplyTransform(); });
+lbActual.addEventListener('click', () => {
+  const nat = lightboxImg.naturalWidth || 1;
+  const shown = lightboxImg.getBoundingClientRect().width / lbState.scale;
+  lbState.scale = Math.min(SCALE_MAX, nat / shown);
+  lbApplyTransform();
+});
+
+// wheel zoom
+lightboxStage.addEventListener('wheel', e => {
+  if (!lbState.open) return;
+  e.preventDefault();
+  const factor = e.deltaY < 0 ? SCALE_STEP : 1 / SCALE_STEP;
+  lbState.scale = Math.min(SCALE_MAX, Math.max(SCALE_MIN, lbState.scale * factor));
+  lbApplyTransform();
+}, { passive: false });
+
+// drag pan (when zoomed)
+let lbDrag = null;
+lightboxStage.addEventListener('mousedown', e => {
+  if (lbState.scale <= 1) return;
+  lbDrag = { x: e.clientX, y: e.clientY, ox: lbPan.x, oy: lbPan.y };
+  lightboxStage.classList.add('dragging');
+});
+let lbPan = { x: 0, y: 0 };
+window.addEventListener('mousemove', e => {
+  if (!lbDrag) return;
+  lbPan = { x: lbDrag.ox + (e.clientX - lbDrag.x), y: lbDrag.oy + (e.clientY - lbDrag.y) };
+  lightboxImg.style.translate = `${lbPan.x}px ${lbPan.y}px`;
+});
+window.addEventListener('mouseup', () => { lbDrag = null; lightboxStage.classList.remove('dragging'); });
+
+// 双击：100% ↔ 适应
+lightboxImg.addEventListener('dblclick', () => { lbState.scale = lbState.scale === 1 ? Math.min(SCALE_MAX, (lightboxImg.naturalWidth || 1) / (lightboxImg.getBoundingClientRect().width || 1)) : 1; lbApplyTransform(); });
+
+// 点击弹窗左图 / 正文图片打开 lightbox
+// Expose the carousel's current real slide index so the click opener can use it.
+let carouselCurrentIndex = 0;
+
+// Edge toast: small floating hint when hitting the first/last slide.
+let edgeToastTimer = 0;
+function toastEdge(text) {
+  let el = document.getElementById('carouselEdgeToast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'carouselEdgeToast';
+    el.setAttribute('aria-live', 'polite');
+    document.body.appendChild(el);
+  }
+  el.textContent = text;
+  el.classList.add('show');
+  clearTimeout(edgeToastTimer);
+  edgeToastTimer = setTimeout(() => el.classList.remove('show'), 1400);
+}
+
+modalImg.addEventListener('click', e => {
+  if (suppressModalImageClick) return;
+  // Arrows and dots manage slides themselves; don't treat them as "view image".
+  if (e.target.closest('.work-carousel-nav, .work-carousel-dot')) return;
+  // Carousel case: the whole media area is the click target (imgs are pointer-events:none for dragging).
+  const track = document.getElementById('carouselTrack');
+  if (track) {
+    const real = [...track.querySelectorAll('.work-carousel-item:not(.clone) img')];
+    const ready = real.filter(i => i.naturalWidth > 0);
+    if (!ready.length) return;
+    const idx = Math.min(Math.max(0, carouselCurrentIndex), real.length - 1);
+    lbOpen(real.map(i => i.currentSrc || i.src), idx);
+    return;
+  }
+  const img = e.target.closest('img');
+  if (!img || !img.naturalWidth) return;
+  e.stopPropagation();
+  lbOpen([img.currentSrc || img.src], 0);
+});
+modalDesc.addEventListener('click', e => {
+  const img = e.target.closest('img');
+  if (!img || !img.naturalWidth) return;
+  e.preventDefault();
+  const all = [...modalDesc.querySelectorAll('img')].map(i => i.currentSrc || i.src);
+  lbOpen(all, all.indexOf(img.currentSrc || img.src));
+});
